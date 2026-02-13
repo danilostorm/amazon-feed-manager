@@ -1,22 +1,43 @@
 <?php
 /**
- * Database Handler - SQLite
+ * Database Handler - MySQL
  */
 
 class Database {
     private $db;
     
     public function __construct() {
-        $dbPath = __DIR__ . '/../data/amazon_feed.db';
+        // Configurar aqui ou criar config.php
+        $host = 'localhost';
+        $dbname = 'amazon_feed';
+        $username = 'root'; // Alterar conforme seu MySQL
+        $password = ''; // Alterar conforme seu MySQL
         
-        // Criar pasta data se não existir
-        if (!file_exists(__DIR__ . '/../data')) {
-            mkdir(__DIR__ . '/../data', 0755, true);
+        // Tentar carregar de config.php se existir
+        if (file_exists(__DIR__ . '/../config.php')) {
+            include __DIR__ . '/../config.php';
+            if (defined('DB_HOST')) $host = DB_HOST;
+            if (defined('DB_NAME')) $dbname = DB_NAME;
+            if (defined('DB_USER')) $username = DB_USER;
+            if (defined('DB_PASS')) $password = DB_PASS;
         }
         
-        $this->db = new PDO('sqlite:' . $dbPath);
-        $this->db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-        $this->createTables();
+        try {
+            $this->db = new PDO(
+                "mysql:host={$host};dbname={$dbname};charset=utf8mb4",
+                $username,
+                $password,
+                [
+                    PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                    PDO::MYSQL_ATTR_INIT_COMMAND => "SET NAMES utf8mb4"
+                ]
+            );
+            
+            $this->createTables();
+        } catch (PDOException $e) {
+            die("Erro de conexão MySQL: " . $e->getMessage() . "<br><br>Verifique as credenciais em config.php");
+        }
     }
     
     public function getPdo() {
@@ -27,66 +48,73 @@ class Database {
         // Tabela de credenciais
         $this->db->exec("
             CREATE TABLE IF NOT EXISTS credentials (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                credential_id TEXT,
-                credential_secret TEXT,
-                version TEXT DEFAULT '2.1',
-                associate_tag TEXT,
-                marketplace TEXT DEFAULT 'www.amazon.com.br',
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                credential_id VARCHAR(255),
+                credential_secret VARCHAR(255),
+                version VARCHAR(10) DEFAULT '2.1',
+                associate_tag VARCHAR(100),
+                marketplace VARCHAR(100) DEFAULT 'www.amazon.com.br',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                INDEX idx_updated (updated_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         ");
         
         // Tabela de categorias
         $this->db->exec("
             CREATE TABLE IF NOT EXISTS categories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                browse_node_id TEXT,
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                browse_node_id VARCHAR(50),
                 keywords TEXT,
-                is_active INTEGER DEFAULT 1,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
+                is_active TINYINT(1) DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_name (name),
+                INDEX idx_active (is_active)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         ");
         
         // Tabela de produtos
         $this->db->exec("
             CREATE TABLE IF NOT EXISTS products (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                asin TEXT UNIQUE NOT NULL,
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                asin VARCHAR(20) UNIQUE NOT NULL,
                 title TEXT,
-                price REAL,
-                currency TEXT DEFAULT 'BRL',
+                price DECIMAL(10,2),
+                currency VARCHAR(10) DEFAULT 'BRL',
                 image_url TEXT,
                 product_url TEXT,
                 affiliate_url TEXT,
                 features TEXT,
-                availability TEXT,
-                rating TEXT,
-                category_id INTEGER,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (category_id) REFERENCES categories(id)
-            )
+                availability VARCHAR(255),
+                rating VARCHAR(50),
+                category_id INT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                INDEX idx_asin (asin),
+                INDEX idx_category (category_id),
+                INDEX idx_updated (updated_at),
+                FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE SET NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         ");
         
         // Tabela de sincronizações
         $this->db->exec("
             CREATE TABLE IF NOT EXISTS sync_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                category_id INTEGER,
-                products_count INTEGER,
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                category_id INT,
+                products_count INT,
                 synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (category_id) REFERENCES categories(id)
-            )
+                INDEX idx_synced (synced_at),
+                FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         ");
     }
     
     public function getCredentials() {
         $stmt = $this->db->query("SELECT * FROM credentials ORDER BY id DESC LIMIT 1");
-        $creds = $stmt->fetch(PDO::FETCH_ASSOC);
+        $creds = $stmt->fetch();
         
         if (!$creds) {
-            // Inserir credenciais padrão do CSV fornecido
+            // Inserir credenciais padrão
             $this->db->exec("
                 INSERT INTO credentials (credential_id, credential_secret, version, associate_tag, marketplace)
                 VALUES ('78ft3eumief9asdv8896d46c2q', '17cf0nstftiqmap47qtjpt7ho91rkc0n0rlndfov77ge23sef1us', '2.1', 'stormanimesbr-20', 'www.amazon.com.br')
@@ -99,8 +127,8 @@ class Database {
     
     public function updateCredentials($data) {
         $stmt = $this->db->prepare("
-            INSERT INTO credentials (credential_id, credential_secret, version, associate_tag, marketplace, updated_at)
-            VALUES (:credential_id, :credential_secret, :version, :associate_tag, :marketplace, CURRENT_TIMESTAMP)
+            INSERT INTO credentials (credential_id, credential_secret, version, associate_tag, marketplace)
+            VALUES (:credential_id, :credential_secret, :version, :associate_tag, :marketplace)
         ");
         
         $stmt->execute([
@@ -114,13 +142,13 @@ class Database {
     
     public function getCategories() {
         $stmt = $this->db->query("SELECT * FROM categories ORDER BY name");
-        return $stmt->fetchAll(PDO::FETCH_ASSOC);
+        return $stmt->fetchAll();
     }
     
     public function getCategory($id) {
         $stmt = $this->db->prepare("SELECT * FROM categories WHERE id = :id");
         $stmt->execute([':id' => $id]);
-        return $stmt->fetch(PDO::FETCH_ASSOC);
+        return $stmt->fetch();
     }
     
     public function saveCategory($data) {
@@ -179,14 +207,26 @@ class Database {
             $stmt->execute();
         }
         
-        return $stmt->fetchAll(PDO::FETCH_ASSOC);
+        return $stmt->fetchAll();
     }
     
     public function saveProduct($product) {
         $stmt = $this->db->prepare("
-            INSERT OR REPLACE INTO products 
-            (asin, title, price, currency, image_url, product_url, affiliate_url, features, availability, rating, category_id, updated_at)
-            VALUES (:asin, :title, :price, :currency, :image_url, :product_url, :affiliate_url, :features, :availability, :rating, :category_id, CURRENT_TIMESTAMP)
+            INSERT INTO products 
+            (asin, title, price, currency, image_url, product_url, affiliate_url, features, availability, rating, category_id)
+            VALUES (:asin, :title, :price, :currency, :image_url, :product_url, :affiliate_url, :features, :availability, :rating, :category_id)
+            ON DUPLICATE KEY UPDATE
+            title = VALUES(title),
+            price = VALUES(price),
+            currency = VALUES(currency),
+            image_url = VALUES(image_url),
+            product_url = VALUES(product_url),
+            affiliate_url = VALUES(affiliate_url),
+            features = VALUES(features),
+            availability = VALUES(availability),
+            rating = VALUES(rating),
+            category_id = VALUES(category_id),
+            updated_at = CURRENT_TIMESTAMP
         ");
         
         $stmt->execute([
@@ -207,7 +247,7 @@ class Database {
     public function getProductByAsin($asin) {
         $stmt = $this->db->prepare("SELECT * FROM products WHERE asin = :asin");
         $stmt->execute([':asin' => $asin]);
-        return $stmt->fetch(PDO::FETCH_ASSOC);
+        return $stmt->fetch();
     }
     
     public function deleteProduct($id) {
@@ -225,7 +265,7 @@ class Database {
         ");
         $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
         $stmt->execute();
-        return $stmt->fetchAll(PDO::FETCH_ASSOC);
+        return $stmt->fetchAll();
     }
     
     public function logSync($categoryId, $count) {
@@ -244,15 +284,15 @@ class Database {
         
         // Total de produtos
         $stmt = $this->db->query("SELECT COUNT(*) as total FROM products");
-        $stats['total_products'] = $stmt->fetch(PDO::FETCH_ASSOC)['total'];
+        $stats['total_products'] = $stmt->fetch()['total'];
         
         // Total de categorias
         $stmt = $this->db->query("SELECT COUNT(*) as total FROM categories WHERE is_active = 1");
-        $stats['total_categories'] = $stmt->fetch(PDO::FETCH_ASSOC)['total'];
+        $stats['total_categories'] = $stmt->fetch()['total'];
         
         // Última sincronização
         $stmt = $this->db->query("SELECT synced_at FROM sync_logs ORDER BY synced_at DESC LIMIT 1");
-        $lastSync = $stmt->fetch(PDO::FETCH_ASSOC);
+        $lastSync = $stmt->fetch();
         $stats['last_sync'] = $lastSync ? $lastSync['synced_at'] : null;
         
         return $stats;
