@@ -1,16 +1,24 @@
 <?php
 /**
- * Amazon Product Advertising API 5.0 Handler + Scraper Fallback
+ * Amazon API Handler - Integra Creators API + Scraper Fallback
  */
+
+require_once __DIR__ . '/AmazonCreatorsAPI.php';
 
 class AmazonAPI {
     private $db;
     private $credentials;
-    private $debugMode = true; // Ativar logs
+    private $creatorsAPI;
+    private $debugMode = true;
     
     public function __construct($db) {
         $this->db = $db;
         $this->credentials = $db->getCredentials();
+        
+        // Inicializar Creators API se credenciais estiverem configuradas
+        if (!empty($this->credentials['credential_id']) && !empty($this->credentials['credential_secret'])) {
+            $this->creatorsAPI = new AmazonCreatorsAPI($this->credentials);
+        }
     }
     
     /**
@@ -58,88 +66,90 @@ class AmazonAPI {
     
     /**
      * Busca produtos por palavra-chave
-     * Tenta PA-API primeiro, depois usa scraper
+     * Tenta Creators API primeiro, depois usa scraper
      */
     public function searchByKeyword($keyword, $browseNodeId = null) {
-        // Se não tiver credenciais configuradas, vai direto pro scraper
-        if (empty($this->credentials['access_key']) || empty($this->credentials['secret_key'])) {
-            return $this->searchByKeywordScraper($keyword, $browseNodeId);
-        }
-        
-        // Tentar PA-API primeiro
-        try {
-            $products = $this->searchByKeywordPAAPI($keyword, $browseNodeId);
-            if (!empty($products)) {
-                return $products;
+        // Tentar Creators API se disponível
+        if ($this->creatorsAPI) {
+            try {
+                $this->debug("Tentando Creators API para: {$keyword}");
+                $response = $this->creatorsAPI->searchItems([
+                    'keywords' => $keyword,
+                    'browseNodeId' => $browseNodeId,
+                    'itemCount' => 10
+                ]);
+                
+                $products = $this->parseCreatorsAPIResponse($response);
+                
+                if (!empty($products)) {
+                    $this->debug("Creators API retornou " . count($products) . " produtos");
+                    return $products;
+                }
+            } catch (Exception $e) {
+                $this->debug("Creators API falhou: " . $e->getMessage());
             }
-        } catch (Exception $e) {
-            // Se falhar, usar scraper
         }
         
         // Fallback: Scraper
+        $this->debug("Usando scraper para: {$keyword}");
         return $this->searchByKeywordScraper($keyword, $browseNodeId);
     }
     
     /**
-     * Busca usando PA-API 5.0 (requer aprovação Amazon)
+     * Parse resposta da Creators API
      */
-    private function searchByKeywordPAAPI($keyword, $browseNodeId = null) {
-        $host = $this->credentials['marketplace'];
-        $uri = '/paapi5/searchitems';
+    private function parseCreatorsAPIResponse($response) {
+        $products = [];
         
-        $payload = [
-            'Keywords' => $keyword,
-            'Resources' => [
-                'Images.Primary.Large',
-                'ItemInfo.Title',
-                'ItemInfo.Features',
-                'Offers.Listings.Price',
-                'Offers.Listings.Availability.Message'
-            ],
-            'PartnerTag' => $this->credentials['associate_tag'],
-            'PartnerType' => 'Associates',
-            'Marketplace' => 'www.amazon.' . (strpos($host, '.br') !== false ? 'com.br' : 'com')
-        ];
-        
-        if ($browseNodeId) {
-            $payload['BrowseNodeId'] = $browseNodeId;
+        if (!isset($response['SearchResult']['Items'])) {
+            return $products;
         }
         
-        $response = $this->makeApiRequest($host, $uri, $payload);
-        
-        $products = [];
-        if (isset($response['SearchResult']['Items'])) {
-            foreach ($response['SearchResult']['Items'] as $item) {
-                $asin = $item['ASIN'];
-                $product = [
-                    'asin' => $asin,
-                    'title' => $item['ItemInfo']['Title']['DisplayValue'] ?? '',
-                    'price' => $item['Offers']['Listings'][0]['Price']['Amount'] ?? null,
-                    'currency' => $item['Offers']['Listings'][0]['Price']['Currency'] ?? 'BRL',
-                    'image_url' => $item['Images']['Primary']['Large']['URL'] ?? null,
-                    'product_url' => $item['DetailPageURL'] ?? null,
-                    'affiliate_url' => $this->generateAffiliateUrl($asin),
-                    'features' => isset($item['ItemInfo']['Features']['DisplayValues']) 
-                        ? json_encode($item['ItemInfo']['Features']['DisplayValues']) 
-                        : null,
-                    'availability' => $item['Offers']['Listings'][0]['Availability']['Message'] ?? null
-                ];
-                
-                $products[] = $product;
+        foreach ($response['SearchResult']['Items'] as $item) {
+            $asin = $item['ASIN'];
+            
+            $product = [
+                'asin' => $asin,
+                'title' => $item['ItemInfo']['Title']['DisplayValue'] ?? 'Produto ' . $asin,
+                'price' => null,
+                'currency' => 'BRL',
+                'image_url' => $item['Images']['Primary']['Large']['URL'] ?? ($item['Images']['Primary']['Medium']['URL'] ?? null),
+                'product_url' => $item['DetailPageURL'] ?? null,
+                'affiliate_url' => $this->generateAffiliateUrl($asin),
+                'features' => null,
+                'availability' => null,
+                'rating' => null
+            ];
+            
+            // Extrair preço
+            if (isset($item['Offers']['Listings'][0]['Price'])) {
+                $price = $item['Offers']['Listings'][0]['Price'];
+                $product['price'] = $price['Amount'] ?? null;
+                $product['currency'] = $price['Currency'] ?? 'BRL';
             }
+            
+            // Extrair disponibilidade
+            if (isset($item['Offers']['Listings'][0]['Availability']['Message'])) {
+                $product['availability'] = $item['Offers']['Listings'][0]['Availability']['Message'];
+            }
+            
+            // Extrair features
+            if (isset($item['ItemInfo']['Features']['DisplayValues'])) {
+                $product['features'] = json_encode($item['ItemInfo']['Features']['DisplayValues']);
+            }
+            
+            $products[] = $product;
         }
         
         return $products;
     }
     
     /**
-     * Método Scraper - Funciona SEM precisar de PA-API aprovada
-     * Múltiplos métodos de parse para maior compatibilidade
+     * Método Scraper (Fallback)
      */
     private function searchByKeywordScraper($keyword, $browseNodeId = null) {
         $marketplace = strpos($this->credentials['marketplace'], '.br') !== false ? 'com.br' : 'com';
         
-        // Montar URL de busca
         if ($browseNodeId) {
             $url = "https://www.amazon.{$marketplace}/s?k=" . urlencode($keyword) . "&rh=n:{$browseNodeId}";
         } else {
@@ -148,7 +158,6 @@ class AmazonAPI {
         
         $this->debug("Fetching URL: {$url}");
         
-        // Fazer requisição com headers corretos
         $html = $this->fetchUrl($url);
         
         if (empty($html)) {
@@ -156,35 +165,21 @@ class AmazonAPI {
             return [];
         }
         
-        $this->debug("HTML length: " . strlen($html) . " chars");
-        
-        // Salvar HTML para debug
-        if ($this->debugMode) {
-            file_put_contents(__DIR__ . '/../cache/last_response.html', $html);
-        }
-        
-        // Tentar múltiplos métodos de parse
         $products = $this->parseAmazonSearchResults($html);
         
         if (empty($products)) {
-            $this->debug("First parse failed, trying alternative method");
             $products = $this->parseAmazonSearchResultsAlternative($html);
         }
         
-        $this->debug("Found " . count($products) . " products");
+        $this->debug("Scraper encontrou " . count($products) . " produtos");
         
         return $products;
     }
     
-    /**
-     * Faz requisição HTTP com headers adequados
-     */
     private function fetchUrl($url) {
+        usleep(rand(500000, 1500000));
+        
         $ch = curl_init();
-        
-        // Adicionar delay aleatório para parecer humano
-        usleep(rand(500000, 1500000)); // 0.5 a 1.5 segundos
-        
         curl_setopt_array($ch, [
             CURLOPT_URL => $url,
             CURLOPT_RETURNTRANSFER => true,
@@ -193,198 +188,114 @@ class AmazonAPI {
             CURLOPT_TIMEOUT => 30,
             CURLOPT_SSL_VERIFYPEER => false,
             CURLOPT_HTTPHEADER => [
-                'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-                'Accept-Language: pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+                'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language: pt-BR,pt;q=0.9',
                 'Accept-Encoding: gzip, deflate, br',
-                'Connection: keep-alive',
-                'Upgrade-Insecure-Requests: 1',
-                'Sec-Fetch-Dest: document',
-                'Sec-Fetch-Mode: navigate',
-                'Sec-Fetch-Site: none',
-                'Cache-Control: max-age=0',
-                'DNT: 1'
+                'Connection: keep-alive'
             ],
             CURLOPT_ENCODING => 'gzip, deflate'
         ]);
         
         $response = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $error = curl_error($ch);
         curl_close($ch);
         
-        if ($error) {
-            $this->debug("CURL Error: {$error}");
-        }
-        
-        $this->debug("HTTP Code: {$httpCode}");
-        
-        if ($httpCode !== 200) {
-            return '';
-        }
-        
-        return $response;
+        return ($httpCode === 200) ? $response : '';
     }
     
-    /**
-     * Parse HTML da página de resultados da Amazon (Método 1)
-     */
     private function parseAmazonSearchResults($html) {
         $products = [];
-        
-        // Usar DOMDocument para parse mais robusto
         $dom = new DOMDocument();
         @$dom->loadHTML('<?xml encoding="UTF-8">' . $html);
         $xpath = new DOMXPath($dom);
-        
-        // Procurar por divs de produto
         $productDivs = $xpath->query("//div[@data-component-type='s-search-result']");
         
-        $this->debug("Found {$productDivs->length} product divs with XPath");
-        
         foreach ($productDivs as $div) {
-            $product = [];
-            
-            // Extrair ASIN
             $asin = $div->getAttribute('data-asin');
             if (empty($asin)) continue;
             
-            $product['asin'] = $asin;
+            $product = ['asin' => $asin];
             
-            // Extrair título
             $titleNodes = $xpath->query(".//h2//span", $div);
-            if ($titleNodes->length > 0) {
-                $product['title'] = trim($titleNodes->item(0)->textContent);
-            } else {
-                $product['title'] = 'Produto ' . $asin;
-            }
+            $product['title'] = ($titleNodes->length > 0) ? trim($titleNodes->item(0)->textContent) : 'Produto ' . $asin;
             
-            // Extrair preço
             $priceNodes = $xpath->query(".//span[@class='a-price']//span[@class='a-offscreen']", $div);
             if ($priceNodes->length > 0) {
-                $priceText = $priceNodes->item(0)->textContent;
-                $priceText = preg_replace('/[^\d,.]/', '', $priceText);
+                $priceText = preg_replace('/[^\d,.]/', '', $priceNodes->item(0)->textContent);
                 $product['price'] = str_replace(',', '.', $priceText);
             }
             
-            // Extrair imagem
             $imgNodes = $xpath->query(".//img[@class='s-image']", $div);
             if ($imgNodes->length > 0) {
                 $product['image_url'] = $imgNodes->item(0)->getAttribute('src');
             }
             
-            // Extrair link
             $linkNodes = $xpath->query(".//h2//a", $div);
             if ($linkNodes->length > 0) {
-                $href = $linkNodes->item(0)->getAttribute('href');
                 $marketplace = strpos($this->credentials['marketplace'], '.br') !== false ? 'com.br' : 'com';
-                $product['product_url'] = 'https://www.amazon.' . $marketplace . $href;
+                $product['product_url'] = 'https://www.amazon.' . $marketplace . $linkNodes->item(0)->getAttribute('href');
             }
             
-            // Extrair rating
-            $ratingNodes = $xpath->query(".//span[contains(@class, 'a-icon-alt')]", $div);
-            if ($ratingNodes->length > 0) {
-                $product['rating'] = $ratingNodes->item(0)->textContent;
-            }
-            
-            // Gerar affiliate URL
             $product['affiliate_url'] = $this->generateAffiliateUrl($asin);
             $product['currency'] = 'BRL';
             $product['availability'] = 'Em estoque';
             
             $products[] = $product;
-            
             if (count($products) >= 20) break;
         }
         
         return $products;
     }
     
-    /**
-     * Parse HTML - Método Alternativo (Regex)
-     */
     private function parseAmazonSearchResultsAlternative($html) {
         $products = [];
-        
-        // Regex para limpar títulos
-        $sponsoredPattern = '/^Anúncio patrocinado\s?[–-]\s?/i';
-        
-        // Dividir HTML em blocos de produtos
         $blocks = preg_split('/data-asin="([A-Z0-9]{10})"/', $html, -1, PREG_SPLIT_DELIM_CAPTURE);
-        
-        $this->debug("Found " . (count($blocks) - 1) . " blocks with regex");
         
         for ($i = 1; $i < count($blocks); $i += 2) {
             if (!isset($blocks[$i]) || !isset($blocks[$i + 1])) continue;
-            
             $asin = $blocks[$i];
             $block = $blocks[$i + 1];
+            if (strlen($asin) !== 10) continue;
             
-            if (empty($asin) || strlen($asin) !== 10) continue;
+            $product = ['asin' => $asin, 'title' => 'Produto ' . $asin];
             
-            $product = ['asin' => $asin];
-            
-            // Extrair Título
-            if (preg_match('/<span[^>]*class="[^"]*a-size-(?:medium|base-plus)[^"]*"[^>]*>([^<]+)</', $block, $matches)) {
-                $product['title'] = html_entity_decode(trim($matches[1]), ENT_QUOTES, 'UTF-8');
-            } elseif (preg_match('/<h2[^>]*>.*?<span[^>]*>([^<]+)</', $block, $matches)) {
-                $product['title'] = html_entity_decode(trim($matches[1]), ENT_QUOTES, 'UTF-8');
-            } else {
-                $product['title'] = 'Produto ' . $asin;
+            if (preg_match('/<span[^>]*>([^<]+)</', $block, $m)) {
+                $product['title'] = html_entity_decode(trim($m[1]), ENT_QUOTES, 'UTF-8');
+            }
+            if (preg_match('/<span class="a-offscreen">([^<]+)</', $block, $m)) {
+                $product['price'] = str_replace(',', '.', preg_replace('/[^\d,.]/', '', $m[1]));
+            }
+            if (preg_match('/<img[^>]*src="([^"]+)"/', $block, $m)) {
+                $product['image_url'] = $m[1];
             }
             
-            // Limpar título
-            $product['title'] = preg_replace($sponsoredPattern, '', $product['title']);
-            $product['title'] = trim($product['title']);
-            
-            // Extrair Preço
-            if (preg_match('/<span class="a-offscreen">([^<]+)</', $block, $matches)) {
-                $priceText = $matches[1];
-                $priceText = preg_replace('/[^\d,.]/', '', $priceText);
-                $product['price'] = str_replace(',', '.', $priceText);
-            }
-            
-            // Extrair Imagem
-            if (preg_match('/<img[^>]*class="s-image"[^>]*src="([^"]+)"/', $block, $matches)) {
-                $product['image_url'] = $matches[1];
-            }
-            
-            // Extrair Link
-            if (preg_match('/<a[^>]*class="[^"]*s-(?:no-outline|underline-text)[^"]*"[^>]*href="([^"]+)"/', $block, $matches)) {
-                $marketplace = strpos($this->credentials['marketplace'], '.br') !== false ? 'com.br' : 'com';
-                $product['product_url'] = 'https://www.amazon.' . $marketplace . html_entity_decode($matches[1], ENT_QUOTES, 'UTF-8');
-            }
-            
-            // Extrair Rating
-            if (preg_match('/([\d,]+)\s+de\s+5\s+estrelas/', $block, $matches)) {
-                $product['rating'] = str_replace(',', '.', $matches[1]) . ' de 5 estrelas';
-            }
-            
-            // Gerar affiliate URL
             $product['affiliate_url'] = $this->generateAffiliateUrl($asin);
             $product['currency'] = 'BRL';
-            $product['availability'] = 'Em estoque';
-            
             $products[] = $product;
-            
             if (count($products) >= 20) break;
         }
         
         return $products;
     }
     
-    /**
-     * Busca produto específico por ASIN
-     */
     public function getProductByAsin($asin) {
-        // Verificar se existe no DB primeiro
         $product = $this->db->getProductByAsin($asin);
+        if ($product) return $product;
         
-        if ($product) {
-            return $product;
+        if ($this->creatorsAPI) {
+            try {
+                $response = $this->creatorsAPI->getItems([$asin]);
+                $products = $this->parseCreatorsAPIResponse($response);
+                if (!empty($products)) {
+                    $this->db->saveProduct($products[0]);
+                    return $products[0];
+                }
+            } catch (Exception $e) {
+                $this->debug("GetItems falhou: " . $e->getMessage());
+            }
         }
         
-        // Se não existir, criar produto básico
         $marketplace = strpos($this->credentials['marketplace'], '.br') !== false ? 'com.br' : 'com';
         $product = [
             'asin' => $asin,
@@ -395,25 +306,13 @@ class AmazonAPI {
         ];
         
         $this->db->saveProduct($product);
-        
         return $product;
     }
     
-    /**
-     * Debug helper
-     */
     private function debug($message) {
         if ($this->debugMode) {
-            $logFile = __DIR__ . '/../cache/scraper.log';
-            $timestamp = date('Y-m-d H:i:s');
-            file_put_contents($logFile, "[{$timestamp}] {$message}\n", FILE_APPEND);
+            $logFile = __DIR__ . '/../cache/amazon-api.log';
+            file_put_contents($logFile, "[" . date('Y-m-d H:i:s') . "] {$message}\n", FILE_APPEND);
         }
-    }
-    
-    /**
-     * Faz requisição assinada para PA-API 5.0
-     */
-    private function makeApiRequest($host, $uri, $payload) {
-        throw new Exception('PA-API 5.0 requer biblioteca oficial. Usando método scraper.');
     }
 }
