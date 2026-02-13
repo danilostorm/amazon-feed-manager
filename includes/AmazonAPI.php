@@ -28,9 +28,8 @@ class AmazonAPI {
      * Busca produtos por categoria
      */
     public function searchProducts($categoryId) {
-        $stmt = $this->db->db->prepare("SELECT * FROM categories WHERE id = :id");
-        $stmt->execute([':id' => $categoryId]);
-        $category = $stmt->fetch(PDO::FETCH_ASSOC);
+        // Usar método getCategory ao invés de acessar $db->db diretamente
+        $category = $this->db->getCategory($categoryId);
         
         if (!$category) {
             throw new Exception('Categoria não encontrada');
@@ -38,6 +37,10 @@ class AmazonAPI {
         
         $products = [];
         $keywords = array_filter(array_map('trim', explode(',', $category['keywords'])));
+        
+        if (empty($keywords)) {
+            throw new Exception('Nenhuma keyword definida para esta categoria');
+        }
         
         foreach ($keywords as $keyword) {
             $results = $this->searchByKeyword($keyword, $category['browse_node_id']);

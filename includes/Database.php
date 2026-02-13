@@ -12,6 +12,13 @@ class Database {
         $this->createTables();
     }
     
+    /**
+     * Retorna instância PDO (para queries customizadas)
+     */
+    public function getPdo() {
+        return $this->db;
+    }
+    
     private function createTables() {
         $this->db->exec("
             CREATE TABLE IF NOT EXISTS credentials (
@@ -98,6 +105,12 @@ class Database {
             ':keywords' => $data['keywords'],
             ':active' => $data['active']
         ]);
+    }
+    
+    public function getCategory($id) {
+        $stmt = $this->db->prepare("SELECT * FROM categories WHERE id = :id");
+        $stmt->execute([':id' => $id]);
+        return $stmt->fetch(PDO::FETCH_ASSOC);
     }
     
     public function deleteCategory($id) {
