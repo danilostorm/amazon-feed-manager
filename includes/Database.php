@@ -97,6 +97,91 @@ class Database {
         return $creds;
     }
     
+    public function updateCredentials($data) {
+        $stmt = $this->db->prepare("
+            INSERT INTO credentials (credential_id, credential_secret, version, associate_tag, marketplace, updated_at)
+            VALUES (:credential_id, :credential_secret, :version, :associate_tag, :marketplace, CURRENT_TIMESTAMP)
+        ");
+        
+        $stmt->execute([
+            ':credential_id' => $data['credential_id'],
+            ':credential_secret' => $data['credential_secret'],
+            ':version' => $data['version'] ?? '2.1',
+            ':associate_tag' => $data['associate_tag'],
+            ':marketplace' => $data['marketplace'] ?? 'www.amazon.com.br'
+        ]);
+    }
+    
+    public function getCategories() {
+        $stmt = $this->db->query("SELECT * FROM categories ORDER BY name");
+        return $stmt->fetchAll(PDO::FETCH_ASSOC);
+    }
+    
+    public function getCategory($id) {
+        $stmt = $this->db->prepare("SELECT * FROM categories WHERE id = :id");
+        $stmt->execute([':id' => $id]);
+        return $stmt->fetch(PDO::FETCH_ASSOC);
+    }
+    
+    public function saveCategory($data) {
+        if (isset($data['id']) && $data['id'] > 0) {
+            // Update
+            $stmt = $this->db->prepare("
+                UPDATE categories 
+                SET name = :name, browse_node_id = :browse_node_id, keywords = :keywords, is_active = :is_active
+                WHERE id = :id
+            ");
+            $stmt->execute([
+                ':id' => $data['id'],
+                ':name' => $data['name'],
+                ':browse_node_id' => $data['browse_node_id'] ?? null,
+                ':keywords' => $data['keywords'] ?? '',
+                ':is_active' => $data['is_active'] ?? 1
+            ]);
+        } else {
+            // Insert
+            $stmt = $this->db->prepare("
+                INSERT INTO categories (name, browse_node_id, keywords, is_active)
+                VALUES (:name, :browse_node_id, :keywords, :is_active)
+            ");
+            $stmt->execute([
+                ':name' => $data['name'],
+                ':browse_node_id' => $data['browse_node_id'] ?? null,
+                ':keywords' => $data['keywords'] ?? '',
+                ':is_active' => $data['is_active'] ?? 1
+            ]);
+        }
+    }
+    
+    public function deleteCategory($id) {
+        $stmt = $this->db->prepare("DELETE FROM categories WHERE id = :id");
+        $stmt->execute([':id' => $id]);
+    }
+    
+    public function getProducts($categoryId = null, $limit = 100) {
+        if ($categoryId) {
+            $stmt = $this->db->prepare("
+                SELECT * FROM products 
+                WHERE category_id = :category_id 
+                ORDER BY updated_at DESC 
+                LIMIT :limit
+            ");
+            $stmt->bindValue(':category_id', $categoryId, PDO::PARAM_INT);
+            $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+            $stmt->execute();
+        } else {
+            $stmt = $this->db->prepare("
+                SELECT * FROM products 
+                ORDER BY updated_at DESC 
+                LIMIT :limit
+            ");
+            $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+            $stmt->execute();
+        }
+        
+        return $stmt->fetchAll(PDO::FETCH_ASSOC);
+    }
+    
     public function saveProduct($product) {
         $stmt = $this->db->prepare("
             INSERT OR REPLACE INTO products 
@@ -125,10 +210,22 @@ class Database {
         return $stmt->fetch(PDO::FETCH_ASSOC);
     }
     
-    public function getCategory($id) {
-        $stmt = $this->db->prepare("SELECT * FROM categories WHERE id = :id");
+    public function deleteProduct($id) {
+        $stmt = $this->db->prepare("DELETE FROM products WHERE id = :id");
         $stmt->execute([':id' => $id]);
-        return $stmt->fetch(PDO::FETCH_ASSOC);
+    }
+    
+    public function getSyncLogs($limit = 50) {
+        $stmt = $this->db->prepare("
+            SELECT sl.*, c.name as category_name
+            FROM sync_logs sl
+            LEFT JOIN categories c ON sl.category_id = c.id
+            ORDER BY sl.synced_at DESC
+            LIMIT :limit
+        ");
+        $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+        $stmt->execute();
+        return $stmt->fetchAll(PDO::FETCH_ASSOC);
     }
     
     public function logSync($categoryId, $count) {
@@ -140,5 +237,24 @@ class Database {
             ':category_id' => $categoryId,
             ':count' => $count
         ]);
+    }
+    
+    public function getStats() {
+        $stats = [];
+        
+        // Total de produtos
+        $stmt = $this->db->query("SELECT COUNT(*) as total FROM products");
+        $stats['total_products'] = $stmt->fetch(PDO::FETCH_ASSOC)['total'];
+        
+        // Total de categorias
+        $stmt = $this->db->query("SELECT COUNT(*) as total FROM categories WHERE is_active = 1");
+        $stats['total_categories'] = $stmt->fetch(PDO::FETCH_ASSOC)['total'];
+        
+        // Última sincronização
+        $stmt = $this->db->query("SELECT synced_at FROM sync_logs ORDER BY synced_at DESC LIMIT 1");
+        $lastSync = $stmt->fetch(PDO::FETCH_ASSOC);
+        $stats['last_sync'] = $lastSync ? $lastSync['synced_at'] : null;
+        
+        return $stats;
     }
 }
